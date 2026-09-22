@@ -260,23 +260,29 @@ export const make = Effect.gen(function* () {
         fingerprint: fingerprintStatusPart(local),
         value: local,
       } satisfies CachedValue<VcsStatusLocalResult>;
-      const shouldPublish = yield* Ref.modify(cacheRef, (cache) => {
+      const change = yield* Ref.modify(cacheRef, (cache) => {
         const previous = cache.get(cwd) ?? { local: null, remote: null };
+        const branchChanged =
+          previous.local !== null && previous.local.value.refName !== local.refName;
         const nextCache = new Map(cache);
         nextCache.set(cwd, {
-          ...previous,
           local: nextLocal,
+          remote: branchChanged
+            ? { fingerprint: fingerprintStatusPart(null), value: null }
+            : previous.remote,
         });
-        return [previous.local?.fingerprint !== nextLocal.fingerprint, nextCache] as const;
+        return [
+          { changed: previous.local?.fingerprint !== nextLocal.fingerprint, branchChanged },
+          nextCache,
+        ] as const;
       });
 
-      if (options?.publish && shouldPublish) {
+      if (options?.publish && change.changed) {
         yield* PubSub.publish(changesPubSub, {
           cwd,
-          event: {
-            _tag: "localUpdated",
-            local,
-          },
+          event: change.branchChanged
+            ? { _tag: "snapshot", local, remote: null }
+            : { _tag: "localUpdated", local },
         });
       }
 
@@ -318,18 +324,33 @@ export const make = Effect.gen(function* () {
     cwd: string,
     local: VcsStatusLocalResult,
     remote: VcsStatusRemoteResult | null,
-    options?: { publish?: boolean },
+    options?: { publish?: boolean; expectedLocal?: CachedValue<VcsStatusLocalResult> | null },
   ) {
-    const nextLocal = {
+    let nextLocal = {
       fingerprint: fingerprintStatusPart(local),
       value: local,
     } satisfies CachedValue<VcsStatusLocalResult>;
-    const nextRemote = {
+    let nextRemote = {
       fingerprint: fingerprintStatusPart(remote),
       value: remote,
     } satisfies CachedValue<VcsStatusRemoteResult | null>;
     const shouldPublish = yield* Ref.modify(cacheRef, (cache) => {
       const previous = cache.get(cwd) ?? { local: null, remote: null };
+      if (
+        options &&
+        "expectedLocal" in options &&
+        previous.local !== options.expectedLocal &&
+        previous.local
+      ) {
+        // A local refresh completed while this remote read was in flight.
+        // Preserve its local state, and never attach an old branch's remote result.
+        if (previous.local.value.refName !== local.refName) {
+          remote = previous.remote?.value ?? null;
+          nextRemote = { fingerprint: fingerprintStatusPart(remote), value: remote };
+        }
+        local = previous.local.value;
+        nextLocal = previous.local;
+      }
       const nextCache = new Map(cache);
       nextCache.set(cwd, {
         local: nextLocal,
@@ -483,20 +504,22 @@ export const make = Effect.gen(function* () {
     const refresh = withRemoteWriteLock(
       cwd,
       Effect.gen(function* () {
+        const expectedLocal = (yield* getCachedStatus(cwd))?.local ?? null;
         yield* workflow.invalidateStatus(cwd);
         const [local, remote] = yield* Effect.all(
           [workflow.localStatus({ cwd }), workflow.remoteStatus({ cwd })],
           { concurrency: "unbounded" },
         );
-        const pulled = yield* maybeAutoPull(cwd, remote, [rawCwd]);
+        const unchanged = ((yield* getCachedStatus(cwd))?.local ?? null) === expectedLocal;
+        const pulled = unchanged ? yield* maybeAutoPull(cwd, remote, [rawCwd]) : null;
         if (pulled !== null) return mergeGitStatusParts(pulled.local, pulled.remote);
-        return yield* updateCachedStatus(cwd, local, remote, { publish: true });
+        return yield* updateCachedStatus(cwd, local, remote, { publish: true, expectedLocal });
       }),
     );
     if (options?.waitForRemote !== false) return yield* refresh;
 
-    const cached = yield* getCachedStatus(cwd);
     const local = yield* refreshLocalStatusCore(cwd);
+    const cached = yield* getCachedStatus(cwd);
     // The UI already subscribes to status updates. A slow fetch or PR lookup
     // must not hold its refresh request open or queue duplicate remote reads.
     yield* Effect.uninterruptibleMask((restore) =>
@@ -522,7 +545,7 @@ export const make = Effect.gen(function* () {
         cwd,
         Effect.gen(function* () {
           const cached = yield* getCachedStatus(cwd);
-          if (cached?.remote?.value == null) return null;
+          if (cached?.remote == null || !cached.local?.value.isRepo) return null;
           const poller = (yield* SynchronizedRef.get(pollersRef)).get(cwd);
           const demandCwds = poller ? [...(yield* Ref.get(poller.demandCwds)).keys()] : [rawCwd];
           const shouldRefresh = (yield* Effect.forEach(
