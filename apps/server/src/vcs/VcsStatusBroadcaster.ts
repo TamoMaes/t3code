@@ -191,7 +191,10 @@ export class VcsStatusBroadcaster extends Context.Service<
     readonly refreshLocalStatus: (
       cwd: string,
     ) => Effect.Effect<VcsStatusLocalResult, GitManagerServiceError>;
-    readonly refreshStatus: (cwd: string) => Effect.Effect<VcsStatusResult, GitManagerServiceError>;
+    readonly refreshStatus: (
+      cwd: string,
+      options?: { readonly waitForRemote?: boolean },
+    ) => Effect.Effect<VcsStatusResult, GitManagerServiceError>;
     /**
      * Refresh a loaded cwd after a turn if background policy allows it.
      * GitManager retries missing PRs for the current branch and keeps known
@@ -470,13 +473,14 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const pendingStatusRefreshes = new Set<string>();
   const refreshStatus: VcsStatusBroadcaster["Service"]["refreshStatus"] = Effect.fn(
     "VcsStatusBroadcaster.refreshStatus",
-  )(function* (rawCwd) {
+  )(function* (rawCwd, options) {
     const cwd = yield* withFileSystem(normalizeCwd(rawCwd));
     // invalidateStatus (not the two partial invalidations) so an explicit
     // refresh also bypasses GitManager's slow PR-lookup cache.
-    return yield* withRemoteWriteLock(
+    const refresh = withRemoteWriteLock(
       cwd,
       Effect.gen(function* () {
         yield* workflow.invalidateStatus(cwd);
@@ -489,6 +493,26 @@ export const make = Effect.gen(function* () {
         return yield* updateCachedStatus(cwd, local, remote, { publish: true });
       }),
     );
+    if (options?.waitForRemote !== false) return yield* refresh;
+
+    const cached = yield* getCachedStatus(cwd);
+    const local = yield* refreshLocalStatusCore(cwd);
+    // The UI already subscribes to status updates. A slow fetch or PR lookup
+    // must not hold its refresh request open or queue duplicate remote reads.
+    yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (pendingStatusRefreshes.has(cwd)) return;
+        pendingStatusRefreshes.add(cwd);
+        yield* restore(refresh).pipe(
+          Effect.ignoreCause({ log: true }),
+          Effect.onExit(() => Effect.sync(() => pendingStatusRefreshes.delete(cwd))),
+          Effect.forkIn(broadcasterScope),
+        );
+      }),
+    );
+    const remote =
+      cached?.local?.value.refName === local.refName ? (cached?.remote?.value ?? null) : null;
+    return mergeGitStatusParts(local, remote);
   });
 
   const refreshPullRequestStatus: VcsStatusBroadcaster["Service"]["refreshPullRequestStatus"] =
